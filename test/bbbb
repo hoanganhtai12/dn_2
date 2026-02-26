@@ -1,0 +1,178 @@
+#include <LCD.h>
+#include <Arduino.h>
+#include <Wire.h>
+#include <Adafruit_INA219.h>
+#include "UIA8060.h"
+
+// --- Cấu hình LCD & Phần cứng ---
+LCD TFT(80, 160);
+uint16_t *BgrSprite;
+#define LCD_LED 39
+#define I2C_SDA 8
+#define I2C_SCL 18
+#define CHARGE_PIN 17  // HIGH = Tắt sạc
+#define LOAD_PIN 16    // HIGH = Bật tải
+#define BOOT_BUTTON 0  
+Adafruit_INA219 ina219(0x40);
+
+// --- 1. HỆ SỐ ĐA THỨC BẬC 8 ---
+const float ocv_coeffs[] = {-3.4632153300e+02, 1.5112606885e+03, -2.7428559297e+03, 2.6905573401e+03, -1.5513638679e+03, 5.3457145432e+02, -1.0655271238e+02, 1.1571510897e+01, 3.2729981641e+00};
+const float r0_coeffs[]  = {-1.0544133772e+02, 4.0924253342e+02, -6.4068139512e+02, 5.1682865175e+02, -2.2679280194e+02, 5.1775075156e+01, -4.9212228520e+00, -3.6913891712e-02, 1.3201441401e-01};
+const float rp_coeffs[]  = {5.6222718254e+02, -2.5184751401e+03, 4.7159244281e+03, -4.7849462868e+03, 2.8511433589e+03, -1.0113303315e+03, 2.0638176321e+02, -2.1863366616e+01, 9.9012600001e-01};
+const float cp_coeffs[]  = {1.0257675439e+07, -4.1364268515e+07, 6.8383786980e+07, -5.9606617217e+07, 2.9249346932e+07, -7.8927763115e+06, 1.0130570251e+06, -3.7187578342e+04, 4.9892719479e+03};
+const float docv_coeffs[] = {-2770.572264, 10578.82482, -16457.13558, 10762.22936, -4654.091604, 1069.142909, -106.552712, 11.571511};
+
+// --- Tham số SoC ---
+const float Ccb = 1.2 * 3600.0; 
+float Xk[2]; // [SoC, Up]
+float soc_coulomb = 0.0;
+float Pk[2][2] = {{1e-2, 0}, {0, 1e-2}};
+float Q[2][2]  = {{1e-6, 0}, {0, 1e-6}}; 
+float R_noise  = 0.01;
+unsigned long last_time;
+
+// --- Biến hiển thị ---
+volatile float d_Vmeas, d_IA, d_SoCK, d_SoCC, d_Verr;
+bool is_charging = true;
+
+float evaluatePoly(const float coeffs[], int degree, float x) {
+    float result = coeffs[0];
+    for (int i = 1; i <= degree; i++) result = result * x + coeffs[i];
+    return result;
+}
+
+float lookup_soc_from_ocv(float v_in) {
+    float segments[][4] = {
+        {3.2729, 3.7692, 0.20149, -0.65946}, {3.7692, 3.8204, 1.95313, -7.26172},
+        {3.8204, 3.8748, 1.83824, -6.82279}, {3.8748, 3.9084, 2.97619, -11.23214},
+        {3.9084, 3.9644, 1.78571, -6.57929}, {3.9644, 4.0016, 2.68817, -10.15699},
+        {4.0016, 4.0388, 2.68817, -10.15699}, {4.0388, 4.0492, 9.61538, -38.13462},
+        {4.0492, 4.0644, 6.57895, -25.83947}, {4.0644, 4.1400, 1.32275, -4.47619}
+    };
+    if (v_in <= 3.2729) return 0.0;
+    if (v_in >= 4.1400) return 1.0;
+    for (int i = 0; i < 10; i++) {
+        if (v_in >= segments[i][0] && v_in < segments[i][1]) 
+            return constrain(segments[i][2] * v_in + segments[i][3], 0.0, 1.0);
+    }
+    return 0.5;
+}
+
+void LCDTask(void* Para) {
+    TickType_t GetTick = xTaskGetTickCount();
+    const int LH = 160 / 6; // Chia đều 6 dòng
+    while(1) {
+        TFT.FillScreen(TFT_BLACK);
+        TFT.DrawRect(0, 0, 80, 160, 1, TFT_BLUEVIOLET);
+        
+        for(int i=0; i<6; i++) {
+            int y = i * LH + 5;
+            TFT.SetStrings(4, y, TFT_GREEN, CHAR_16x8);
+            switch(i) {
+                case 0: TFT.Printf("V: %.3fV", d_Vmeas); break;
+                case 1: TFT.SetString(TFT_CYAN); TFT.Printf("I: %.4fA", d_IA); break;
+                case 2: TFT.SetString(TFT_YELLOW); TFT.Printf("SoK:%.1f%%", d_SoCK * 100.0); break;
+                case 3: TFT.SetString(TFT_ORANGE); TFT.Printf("SoC:%.1f%%", d_SoCC * 100.0); break;
+                case 4: TFT.SetString(TFT_MAGENTA); TFT.Printf("Err:%.3f", d_Verr); break;
+                case 5: 
+                    TFT.SetString(is_charging ? TFT_GREEN : TFT_RED);
+                    TFT.Printf("CHG: %s", is_charging ? "ON" : "OFF"); 
+                    break;
+            }
+        }
+        TFT.PushSprite(0xFFFF);
+        vTaskDelayUntil(&GetTick, 500 / portTICK_PERIOD_MS);
+    }
+}
+
+void setup() {
+    Serial.begin(115200);
+    // Cấu hình Relay/MOSFET: HIGH bật tải, LOW tắt nạp (theo logic nạp tắt bằng HIGH)
+    pinMode(LOAD_PIN, OUTPUT); digitalWrite(LOAD_PIN, HIGH); // Bật tải
+    pinMode(CHARGE_PIN, OUTPUT); digitalWrite(CHARGE_PIN, LOW); // LOW = Đang bật sạc
+    
+    pinMode(BOOT_BUTTON, INPUT_PULLUP);
+    pinMode(LCD_LED, OUTPUT); analogWrite(LCD_LED, 1000);
+
+    Wire.begin(I2C_SDA, I2C_SCL);
+    ina219.begin();
+
+    BgrSprite = new uint16_t[80 * 160];
+    TFT.Config(BgrSprite, 40, 42, 41, 1, 1, 2);
+    TFT.Init(&SPI);
+    TFT.CreateSprite(0, 0, 80, 160);
+
+    // --- KHỞI TẠO SOC ---
+    float v_meas_init = ina219.getBusVoltage_V();
+    float i_init = (ina219.getCurrent_mA() / 1000.0);
+    float init_soc_guess = lookup_soc_from_ocv(v_meas_init);
+    float r0_init = evaluatePoly(r0_coeffs, 8, init_soc_guess);
+    float v_start = v_meas_init - i_init * r0_init;
+    
+    Xk[0] = lookup_soc_from_ocv(v_start);
+    Xk[1] = 0.0;
+    soc_coulomb = Xk[0];
+    last_time = millis();
+
+    xTaskCreatePinnedToCore(LCDTask, "LCDTask", 10000, NULL, 3, NULL, 0);
+}
+
+void loop() {
+    unsigned long now = millis();
+    float dt = (now - last_time) / 1000.0;
+    
+    if (dt >= 1.0) {
+        last_time = now;
+        float V_meas = ina219.getBusVoltage_V();
+        float I_k = (ina219.getCurrent_mA() / 1000.0);
+
+        // 1. Coulomb Counting
+        soc_coulomb = (I_k * dt) / Ccb;
+      
+        // 2. EKF Prediction
+        float r0 = evaluatePoly(r0_coeffs, 8, Xk[0]);
+        float rp = evaluatePoly(rp_coeffs, 8, Xk[0]);
+        float cp = evaluatePoly(cp_coeffs, 8, Xk[0]);
+        float tau = max(rp * cp, 0.1f);
+        float Ad_rc = exp(-dt / tau);
+
+        float X_p[2] = { Xk[0] + (dt/Ccb)*I_k, Ad_rc*Xk[1] - rp*(1.0f - Ad_rc)*I_k };
+        float P_p[2][2] = { {Pk[0][0]+Q[0][0], Pk[0][1]*Ad_rc}, {Pk[1][0]*Ad_rc, Ad_rc*Pk[1][1]*Ad_rc+Q[1][1]} };
+
+        // 3. EKF Update
+        float ocv_p = evaluatePoly(ocv_coeffs, 8, X_p[0]);
+        float dOCV = max(evaluatePoly(docv_coeffs, 7, X_p[0]), 0.01f);
+        float V_p = ocv_p - X_p[1] + I_k * r0;
+        float err = V_meas - V_p;
+
+        float H[2] = {dOCV, -1.0};
+        float S = H[0]*P_p[0][0]*H[0] + H[0]*P_p[1][0]*H[1] + H[1]*P_p[0][1]*H[0] + H[1]*P_p[1][1]*H[1] + R_noise;
+        float K[2] = { (P_p[0][0]*H[0] + P_p[0][1]*H[1])/S, (P_p[1][0]*H[0] + P_p[1][1]*H[1])/S };
+
+        Xk[0] = constrain(X_p[0] + K[0]*err, 0.0, 1.0);
+        Xk[1] = X_p[1] + K[1]*err;
+
+        // Cập nhật ma trận P
+        float IKH[2][2] = { {1.0f - K[0]*H[0], -K[0]*H[1]}, {-K[1]*H[0], 1.0f - K[1]*H[1]} };
+        float P_new[2][2];
+        for(int i=0; i<2; i++) {
+            for (int j=0; j<2; j++) P_new[i][j] = IKH[i][0]*P_p[0][j] + IKH[i][1]*P_p[1][j];
+        }
+        memcpy(Pk, P_new, sizeof(Pk));
+
+        // Sync biến hiển thị
+        d_Vmeas = V_meas; d_IA = I_k; d_SoCK = Xk[0]; d_SoCC = soc_coulomb; d_Verr = err;
+    }
+    
+    // Nút BOOT đảo trạng thái sạc
+    if (digitalRead(BOOT_BUTTON) == LOW) {
+        delay(50);
+        if (digitalRead(BOOT_BUTTON) == LOW) {
+            is_charging = !is_charging;
+            // logic: HIGH = Tắt sạc, LOW = Bật sạc
+            digitalWrite(CHARGE_PIN, is_charging ? LOW : HIGH); 
+            while(digitalRead(BOOT_BUTTON) == LOW); 
+        }
+    }
+    delay(10);
+}

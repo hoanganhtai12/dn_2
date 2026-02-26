@@ -1,0 +1,4 @@
+{
+    "cmake.sourceDirectory": "D:/Project/PlatformIO/ESP32S3/ESP32S3CAM/lib/ArduinoJson/extras/tests/IntegrationTests",
+    "C_Cpp.errorSquiggles": "disabled"
+}

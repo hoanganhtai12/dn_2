@@ -1,0 +1,12 @@
+# Syntax Coloring Map For ADE7753 Library
+
+# Datatypes (KEYWORD1)
+ADE7753	KEYWORD1
+
+# Methods and Functions (KEYWORD2)
+begin	KEYWORD2
+end	KEYWORD2
+
+# Instances (KEYWORD2)
+
+# Constants (LITERAL1)
